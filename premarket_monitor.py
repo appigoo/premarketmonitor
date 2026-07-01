@@ -1625,9 +1625,12 @@ def fetch_macro_leads() -> dict:
     is_pre = time(4, 0) <= et_t < time(9, 30)
     results = {}
 
-    # DXY fallback chain: DX=F → UUP (Invesco DB USD ETF, tracks DXY closely)
-    # UUP is an equity ETF so chart API works reliably on cloud
-    DXY_CHAIN = ["DX=F", "UUP"]
+    # DXY fallback chain:
+    # 1. DX=F  — ICE Dollar Index futures (exact value ~100-110)
+    # 2. ^DXY  — Yahoo Finance spot index (same value range)
+    # 3. UUP   — Invesco ETF (~$28), pct change only; price scaled to DXY equiv
+    DXY_CHAIN = ["DX=F", "^DXY", "UUP"]
+    UUP_TO_DXY_FACTOR = 3.73   # UUP * 3.73 ≈ DXY; historical regression constant
 
     def _yf_daily(tk: str) -> dict | None:
         """Fetch last 7 days of daily bars, return normalised dict."""
@@ -1690,11 +1693,18 @@ def fetch_macro_leads() -> dict:
             results[ticker] = dict(meta=meta, error="載入失敗")
             continue
 
-        # UUP label override: show "DXY≈" prefix so user knows it's a proxy
+        # Label + price scaling for fallback tickers
         display_meta = dict(meta)
-        if actual_ticker == "UUP":
+        uup_scaled   = False   # flag: price was scaled from UUP
+        if actual_ticker == "^DXY":
+            display_meta["label"] = "DXY (現貨)"
+            display_meta["note"]  = "Yahoo Finance DXY現貨指數"
+        elif actual_ticker == "UUP":
+            # UUP price ~$28 — scale to DXY equivalent so display is meaningful
+            # pct change is identical (same underlying), so no scaling needed for pct
             display_meta["label"] = "DXY≈ (UUP)"
-            display_meta["note"]  = "UUP ETF代理 — DXY期貨暫不可用"
+            display_meta["note"]  = "UUP ETF×3.73代理 — DX=F/^DXY暫不可用"
+            uup_scaled = True
 
         # Pick best price + pct for current session
         if is_pre and d.get("pre_price") and d.get("pre_pct") is not None:
@@ -1709,6 +1719,13 @@ def fetch_macro_leads() -> dict:
             disp_price  = d.get("price") or d.get("prev")
             disp_pct    = None
             session_lbl = "—"
+
+        # Scale UUP price to DXY-equivalent so display shows ~100-110 not ~$28
+        if uup_scaled and disp_price:
+            disp_price = disp_price * UUP_TO_DXY_FACTOR
+            # Also scale high/low for consistency
+            if d.get("high"): d["high"] = d["high"] * UUP_TO_DXY_FACTOR
+            if d.get("low"):  d["low"]  = d["low"]  * UUP_TO_DXY_FACTOR
 
         # 5-day spark from daily closes (reuse _yf_daily data when available)
         spark = ""
@@ -1893,11 +1910,13 @@ def render_macro_lead_panel():
         if ticker == "BTC-USD" and (pct or 0) <= -1.5: card_extra = "risk-off"
         if ticker == "GC=F"    and (pct or 0) >= 1.0:  card_extra = "risk-off"
 
-        # Format price: BTC no decimal needed if >1000, others 2dp
+        # Format price
+        actual_tk_used = d.get("actual_tk", ticker)
         if ticker == "BTC-USD" and price and price > 1000:
             price_str = f"${price:,.0f}"
         elif ticker == "DX=F":
-            price_str = f"{price:.3f}" if price else "—"
+            # DX=F, ^DXY, or UUP-scaled all display as index value (no $)
+            price_str = f"{price:.2f}" if price else "—"
         else:
             price_str = f"${fmt_num(price)}"
 
