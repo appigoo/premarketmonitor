@@ -801,6 +801,79 @@ def render_fear_greed():
 
 
 # ── Weekly events — Groq auto-generate ───────────────────────────────────────
+# ── Known ET release times — auto-fills missing et_time from Groq ────────────
+# Keyed by keyword fragments (lowercase). Checked against event text.
+KNOWN_ET_TIMES = {
+    # Economic data — fixed BLS/BEA/Fed schedule
+    "cpi":                    "08:30",
+    "消費者物價":              "08:30",
+    "ppi":                    "08:30",
+    "生產者物價":              "08:30",
+    "零售銷售":                "08:30",
+    "retail sales":           "08:30",
+    "初領失業":                "08:30",
+    "jobless claims":         "08:30",
+    "非農":                   "08:30",
+    "nonfarm payroll":        "08:30",
+    "失業率":                  "08:30",
+    "gdp":                    "08:30",
+    "個人消費支出":            "08:30",
+    "pce":                    "08:30",
+    "耐用品":                  "08:30",
+    "貿易差額":                "08:30",
+    "密歇根":                  "10:00",
+    "消費者信心":               "10:00",
+    "consumer confidence":    "10:00",
+    "ism製造":                 "10:00",
+    "ism服務":                 "10:00",
+    "採購經理":                 "10:00",
+    "新屋銷售":                "10:00",
+    "成屋銷售":                "10:00",
+    "fomc":                   "14:00",
+    "聯儲會議":                "14:00",
+    "利率決議":                "14:00",
+    "鮑威爾記者":              "14:30",
+    "沃什記者":                "14:30",
+    "warsh press":            "14:30",
+    "baker hughes":           "13:00",
+    "鑽井數":                  "13:00",
+    # Market open/close
+    "ipo":                    "09:30",
+    "上市":                    "09:30",
+    "期權到期":                "16:00",
+    "options expiry":         "16:00",
+    # TSLA specific
+    "tsla交付":               "06:00",   # delivery report ~6am ET on first biz day
+    "tsla delivery":          "06:00",
+    "q2交付":                  "06:00",
+    "q2 delivery":            "06:00",
+    "財報":                    "盤後",    # earnings usually after close
+    "earnings":               "盤後",
+    "業績":                    "盤後",
+}
+
+def _fill_et_time(event: dict) -> dict:
+    """Auto-fill et_time if empty, based on KNOWN_ET_TIMES keyword match."""
+    if event.get("et_time"):
+        return event
+    text_lower = event.get("text","").lower()
+    for keyword, t in KNOWN_ET_TIMES.items():
+        if keyword in text_lower:
+            event = dict(event, et_time=t)
+            break
+    return event
+
+
+def _enrich_fallback(events: list) -> list:
+    """Apply _fill_et_time and sort to fallback events list."""
+    enriched = []
+    for day in events:
+        evs = [_fill_et_time(dict(e)) for e in day.get("events",[])]
+        evs.sort(key=lambda e: e.get("et_time","") or "99:99")
+        enriched.append(dict(day, events=evs))
+    return enriched
+
+
 _FALLBACK_EVENTS = [
     {"date":"2026-06-09","weekday":"周一 MON","events":[
         {"text":"Kevin Warsh 就任美聯儲主席","color":"red","impact":"high","note":"Warsh 鷹派傾向，加息預期上移","et_time":""},
@@ -831,7 +904,7 @@ def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
     if st.session_state.weekly_events and st.session_state.weekly_events_fetched == monday:
         return st.session_state.weekly_events
     if not serper_key or not groq_key:
-        return _FALLBACK_EVENTS
+        return _enrich_fallback(_FALLBACK_EVENTS)
     queries = [
         "US economic calendar CPI PPI retail sales this week",
         "Federal Reserve Fed chair Warsh Powell FOMC this week",
@@ -850,7 +923,7 @@ def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
         except Exception:
             pass
     if not snippets:
-        return _FALLBACK_EVENTS
+        return _enrich_fallback(_FALLBACK_EVENTS)
     et = pytz.timezone("America/New_York")
     today = datetime.now(et).date()
     mon   = today - timedelta(days=today.weekday())
@@ -883,23 +956,35 @@ def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
 
 規則：
 - 每天 1-4 個事件，只列重要事件，按 ET 時間升序排列
-- et_time: 有具體時間填 HH:MM（如 08:30），無具體時間填空字串
+- et_time: **必須填寫**已知時間，不可留空字串。參考以下固定時間表：
+  * 08:30 ET — CPI/PPI/零售銷售/非農/初領失業金/PCE/耐用品
+  * 10:00 ET — 密歇根消費者信心/ISM/新屋成屋銷售/消費者信心
+  * 13:00 ET — Baker Hughes鑽井數
+  * 14:00 ET — FOMC利率決議
+  * 14:30 ET — Fed主席記者會
+  * 09:30 ET — IPO首日上市/市場開盤事件
+  * 盤後 — 財報/業績發布（若無具體時間填"盤後"）
+  * 06:00 ET — TSLA交付數據（季度初第一個工作日）
+  * 無法確認時間的事件填空字串
 - color: red=重大風險/央行/地緣, amber=中等/貿易/數據, blue=例行數據, purple=聯儲官員, green=利好
 - impact: high=市場必看, med=中等影響, low=參考
-- note 要具體，點出對科技股/TSLA 的影響方向"""
+- note 要具體，點出對科技股/TSLA 的影響方向
+- **特別注意**：若本週或下週初有TSLA Q2交付數據（通常7月第一個工作日）、TSLA財報（通常7月第三週）、FOMC會議，必須列入並標注準確時間"""
     try:
         raw = groq_chat(prompt, groq_key, max_tokens=1600, temperature=0.2)
         raw = raw.replace("```json","").replace("```","").strip()
         events = json.loads(raw)
         for day in events:
             assert "date" in day and "events" in day
-            # FIX #4: sort events by et_time within each day
+            # Auto-fill missing et_time from KNOWN_ET_TIMES
+            day["events"] = [_fill_et_time(e) for e in day["events"]]
+            # Sort events by ET time ascending
             day["events"].sort(key=lambda e: e.get("et_time","") or "99:99")
         st.session_state.weekly_events = events
         st.session_state.weekly_events_fetched = monday
         return events
     except Exception:
-        return _FALLBACK_EVENTS
+        return _enrich_fallback(_FALLBACK_EVENTS)
 
 
 def render_weekly_calendar(events: list, source_label: str):
@@ -913,6 +998,41 @@ def render_weekly_calendar(events: list, source_label: str):
                 st.markdown(f'<div class="cal-alert-strip">🔔 今日高影響事件：{alerts}</div>',
                             unsafe_allow_html=True)
             break
+
+    # ── TSLA Upcoming Key Events reminder (hardcoded awareness) ──
+    et_now   = datetime.now(pytz.timezone("America/New_York"))
+    et_today = et_now.date()
+    reminders = []
+    # Q2 delivery: first business day of July
+    import calendar as _cal
+    _jul1 = et_today.replace(month=7, day=1)
+    # Find first Mon-Fri of July
+    _q2_delivery = _jul1
+    while _q2_delivery.weekday() >= 5:   # skip Sat/Sun
+        _q2_delivery += timedelta(days=1)
+    days_to_delivery = (_q2_delivery - et_today).days
+    if 0 <= days_to_delivery <= 7:
+        _d_str = _q2_delivery.strftime("%-m月%-d日")
+        _urgency = "🚨 今日" if days_to_delivery == 0 else f"📅 {days_to_delivery}日後"
+        reminders.append(
+            f"{_urgency} TSLA Q2交付數據預計 <b>{_d_str} ~06:00 ET</b> 發布 — "
+            f"高於預期→缺口上升，低於預期→缺口下跌，Binary Event！"
+        )
+    # Q2 earnings: typically 3rd Tuesday/Wednesday of July
+    _q2_earn_approx = et_today.replace(month=7, day=22)
+    days_to_earn = (_q2_earn_approx - et_today).days
+    if 0 <= days_to_earn <= 14:
+        reminders.append(
+            f"📅 {days_to_earn}日後 TSLA Q2財報預計 <b>7月22日前後 盤後</b> — "
+            f"提前留意IV急升，考慮earnings play策略"
+        )
+    if reminders:
+        for r in reminders:
+            st.markdown(
+                f'<div style="background:#EAF4EE;border-left:3px solid #3A7D5C;'
+                f'border-radius:0 4px 4px 0;padding:.45rem .85rem;font-family:var(--sans,sans-serif);'
+                f'font-size:.76rem;color:#1E4D35;margin-bottom:.3rem">🚗 {r}</div>',
+                unsafe_allow_html=True)
     st.markdown('<div class="section-label">▸ 📅 本週重磅事件日曆 · 宏觀催化劑追蹤</div>', unsafe_allow_html=True)
     imp_map  = {"high":"imp-high","med":"imp-med","low":"imp-low"}
     imp_text = {"high":"高影響","med":"中影響","low":"低影響"}
@@ -2790,7 +2910,16 @@ def generate_trading_prompt(events, oil_data, tsla_data, vix_data, qqq_data, is_
 2. **油價{wti_dir} {wti_str}** 對今日科技股有何具體影響？
 3. **TSLA 今日交易策略**：根據上方技術數據，建議具體入場區間、止損位（參考ATR止損）、目標位（$數字）？
 4. **VIX {vix_val}** 顯示市場情緒如何？適合做多/做空/觀望？
-5. 今日最需要關注的**時間點**（數據發布/官員講話/峰會消息）？
+5. 今日最需要關注的**時間點**時序表（請列出今日所有已知ET時間，格式：HH:MM — 事件 — 預期影響方向）？
+
+**已知固定時間點參考**（請確認今日是否有以下發布）：
+- 08:30 ET — 若有CPI/PPI/非農/零售/PCE/初領失業金
+- 10:00 ET — 若有密歇根消費者信心/ISM
+- 13:00 ET — Baker Hughes鑽井數（週五）
+- 14:00 ET — 若有FOMC利率決議
+- 14:30 ET — 若有Fed主席記者會
+- 盤後 — 若有科技財報（TSLA/NVDA/MSFT等）
+- TSLA Q2交付數據通常7月第一個工作日約06:00 ET發布
 
 請用繁體中文回答，要具體，每點包含數字區間。"""
 
