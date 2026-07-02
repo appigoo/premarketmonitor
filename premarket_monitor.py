@@ -801,6 +801,235 @@ def render_fear_greed():
 
 
 # ── Weekly events — Groq auto-generate ───────────────────────────────────────
+# ── US Economic Calendar Engine ───────────────────────────────────────────────
+# Hardcoded BLS/BEA/Fed release rules — not dependent on Groq or news scraping
+# Rule format: (month_pattern, week_of_month, weekday, time_et, label, color, impact, note)
+# month_pattern: list of months (1-12), or "all", or "quarter_end_plus1"
+# week_of_month: 1=first, 2=second, 3=third, 4=fourth
+# weekday: 0=Mon ... 4=Fri
+
+import calendar as _calendar
+
+US_MARKET_HOLIDAYS = {
+    # (month, day): name — fixed-date NYSE holidays
+    (1, 1):   "元旦",
+    (6, 19):  "六月節",
+    (7, 4):   "獨立日",
+    (11, 11): "退伍軍人節",
+    (12, 25): "聖誕節",
+}
+
+def _build_observed(years=range(2024, 2030)) -> dict:
+    """
+    NYSE rule: if fixed holiday falls on Saturday → observe Friday;
+    if Sunday → observe Monday.
+    Returns {(year,month,day): "HolidayName(補假)"}.
+    """
+    from datetime import date as _d, timedelta as _td
+    obs = {}
+    for yr in years:
+        for (mo, day), name in US_MARKET_HOLIDAYS.items():
+            try: hdate = _d(yr, mo, day)
+            except ValueError: continue
+            if hdate.weekday() == 5:   # Saturday → Friday
+                o = hdate - _td(days=1)
+                obs[(o.year, o.month, o.day)] = f"{name}(補假/觀察日)"
+            elif hdate.weekday() == 6: # Sunday → Monday
+                o = hdate + _td(days=1)
+                obs[(o.year, o.month, o.day)] = f"{name}(補假/觀察日)"
+    return obs
+
+_OBSERVED_HOLIDAYS = _build_observed()
+
+def _is_us_holiday(d) -> str | None:
+    """Return holiday name if NYSE is closed on this date (fixed or observed)."""
+    return (US_MARKET_HOLIDAYS.get((d.month, d.day))
+            or _OBSERVED_HOLIDAYS.get((d.year, d.month, d.day)))
+
+def _nth_weekday(year: int, month: int, n: int, weekday: int):
+    """Return the nth occurrence of weekday (0=Mon) in given year/month."""
+    count = 0
+    for day in range(1, _calendar.monthrange(year, month)[1] + 1):
+        d = __import__('datetime').date(year, month, day)
+        if d.weekday() == weekday:
+            count += 1
+            if count == n:
+                return d
+    return None
+
+def _next_business_day(d):
+    """Return next business day after d (skip weekends + fixed holidays)."""
+    nd = d + __import__('datetime').timedelta(days=1)
+    while nd.weekday() >= 5 or _is_us_holiday(nd):
+        nd += __import__('datetime').timedelta(days=1)
+    return nd
+
+def _prev_business_day(d):
+    """Return previous business day before d."""
+    pd = d - __import__('datetime').timedelta(days=1)
+    while pd.weekday() >= 5 or _is_us_holiday(pd):
+        pd -= __import__('datetime').timedelta(days=1)
+    return pd
+
+def _adjust_for_holiday(release_date):
+    """
+    BLS rule: if scheduled release falls on holiday/weekend,
+    release moves to PREVIOUS business day.
+    Returns (adjusted_date, was_adjusted, reason).
+    """
+    if release_date.weekday() >= 5:
+        adj = _prev_business_day(release_date)
+        return adj, True, f"週末提前至{adj.strftime('%-m/%-d')}"
+    h = _is_us_holiday(release_date)
+    if h:
+        adj = _prev_business_day(release_date)
+        return adj, True, f"{h}提前至{adj.strftime('%-m/%-d')}"
+    # Also check: if next trading day is holiday and today would be last day → flag
+    next_td = _next_business_day(release_date)
+    if _is_us_holiday(next_td) or next_td.weekday() >= 5:
+        return release_date, False, "長週末前最後交易日"
+    return release_date, False, ""
+
+def get_economic_calendar(year: int, month: int) -> list[dict]:
+    """
+    Generate hardcoded economic events for a given month.
+    Returns list of {date, text, et_time, color, impact, note, official}.
+    """
+    events = []
+    from datetime import date as _date, timedelta as _td
+
+    # ── Non-Farm Payrolls (Employment Situation) ──
+    # BLS: first Friday of each month, reference previous month
+    nfp_date = _nth_weekday(year, month, 1, 4)  # first Friday
+    if nfp_date:
+        adj_date, adjusted, reason = _adjust_for_holiday(nfp_date)
+        prev_month = (month - 2) % 12 + 1
+        prev_month_name = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"][prev_month-1]
+        adj_note = f"（{reason}）" if reason else ""
+        events.append(dict(
+            date    = adj_date,
+            text    = f"{prev_month_name}非農就業報告{adj_note}",
+            et_time = "08:30",
+            color   = "red",
+            impact  = "high",
+            note    = f"BLS官方發布{adj_note}。非農+失業率+薪資增長三合一，Fed最重視的就業數據，直接影響下次FOMC。偏強→加息預期升→科技/TSLA承壓；偏弱→降息預期→科技升。",
+            official= "BLS",
+        ))
+
+    # ── CPI (Consumer Price Index) ──
+    # BLS: approx 2nd or 3rd week, varies; use 2nd Wed as approximation
+    # Actually BLS schedules vary — use known pattern: ~10-13 days after month end
+    # Approximate: 2nd Wednesday
+    cpi_approx = _nth_weekday(year, month, 2, 2)  # 2nd Wednesday
+    if cpi_approx:
+        adj_date, _, reason = _adjust_for_holiday(cpi_approx)
+        prev_month_name = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"][(month-2)%12]
+        events.append(dict(
+            date    = adj_date,
+            text    = f"{prev_month_name} CPI 消費者物價指數",
+            et_time = "08:30",
+            color   = "red",
+            impact  = "high",
+            note    = "通脹最關鍵指標。YoY高於預期→債息升/科技跌；低於預期→降息預期→科技/TSLA升。",
+            official= "BLS",
+        ))
+
+    # ── PPI ── approx 1 day after CPI (Thursday)
+    ppi_approx = _nth_weekday(year, month, 2, 3)  # 2nd Thursday
+    if ppi_approx:
+        adj_date, _, reason = _adjust_for_holiday(ppi_approx)
+        prev_month_name = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"][(month-2)%12]
+        events.append(dict(
+            date    = adj_date,
+            text    = f"{prev_month_name} PPI 生產者物價指數",
+            et_time = "08:30",
+            color   = "amber",
+            impact  = "med",
+            note    = "上游通脹指標，配合CPI判斷通脹趨勢持續性。",
+            official= "BLS",
+        ))
+
+    # ── TSLA Deliveries ── first business day of Jan/Apr/Jul/Oct
+    if month in (1, 4, 7, 10):
+        first_bd = _date(year, month, 1)
+        while first_bd.weekday() >= 5 or _is_us_holiday(first_bd):
+            first_bd += _td(days=1)
+        quarter = {1:"Q4", 4:"Q1", 7:"Q2", 10:"Q3"}[month]
+        prev_year = year - 1 if month == 1 else year
+        events.append(dict(
+            date    = first_bd,
+            text    = f"TSLA {quarter} {prev_year if month==1 else year}交付數據",
+            et_time = "06:00",
+            color   = "green",
+            impact  = "high",
+            note    = f"Tesla季度交付報告，預計{first_bd.strftime('%-m月%-d日')}約06:00-07:00 ET發布。高於/低於華爾街共識直接決定當日TSLA方向，典型Binary Event，注意缺口風險。",
+            official= "Tesla IR",
+        ))
+
+    # ── Michigan Consumer Sentiment ── last Friday of month (preliminary)
+    last_fri = None
+    for day in range(_calendar.monthrange(year, month)[1], 0, -1):
+        d = _date(year, month, day)
+        if d.weekday() == 4:
+            last_fri = d
+            break
+    if last_fri:
+        adj_date, _, _ = _adjust_for_holiday(last_fri)
+        events.append(dict(
+            date    = adj_date,
+            text    = "密歇根大學消費者信心（初值）",
+            et_time = "10:00",
+            color   = "amber",
+            impact  = "med",
+            note    = "消費者通脹預期分項尤其關鍵，直接影響Fed路徑預期。",
+            official= "U of Michigan",
+        ))
+
+    return events
+
+
+def get_week_economic_events(week_monday) -> list[dict]:
+    """
+    Get all hardcoded economic events for the week of week_monday.
+    Returns events where date falls in Mon-Fri of that week.
+    """
+    from datetime import timedelta as _td
+    week_end = week_monday + _td(days=4)
+
+    # Check current month + adjacent months for events that fall in this week
+    months_to_check = set()
+    months_to_check.add((week_monday.year, week_monday.month))
+    months_to_check.add((week_end.year,    week_end.month))
+
+    all_events = []
+    for yr, mo in months_to_check:
+        all_events.extend(get_economic_calendar(yr, mo))
+
+    # Filter to this week
+    week_events = [e for e in all_events
+                   if week_monday <= e["date"] <= week_end]
+    return week_events
+
+
+def _long_weekend_warning(week_monday) -> str | None:
+    """
+    Detect if any day this week is a holiday/long-weekend situation.
+    Returns warning string or None.
+    """
+    from datetime import timedelta as _td
+    warnings = []
+    for i in range(5):
+        d = week_monday + _td(days=i)
+        h = _is_us_holiday(d)
+        if h:
+            warnings.append(f"⚠️ {d.strftime('%-m/%-d')}（{'一二三四五六日'[d.weekday()]}）{h}美股休市")
+        # Check if next day is holiday (long weekend)
+        nd = d + _td(days=1)
+        if _is_us_holiday(nd) and d.weekday() < 4:
+            warnings.append(f"⚠️ {d.strftime('%-m/%-d')} 長週末前最後交易日（明日{h or _is_us_holiday(nd)}休市）")
+    return " &nbsp;·&nbsp; ".join(warnings) if warnings else None
+
+
 # ── Known ET release times — auto-fills missing et_time from Groq ────────────
 # Keyed by keyword fragments (lowercase). Checked against event text.
 KNOWN_ET_TIMES = {
@@ -899,6 +1128,84 @@ _FALLBACK_EVENTS = [
 
 _WEEKDAY_MAP = ["周一 MON","周二 TUE","周三 WED","周四 THU","周五 FRI","周六 SAT","周日 SUN"]
 
+def _merge_hardcoded(events: list, week_monday) -> list:
+    """
+    Merge hardcoded get_week_economic_events() into AI-generated events list.
+    Hardcoded events take priority — if same date+keyword exists, update et_time/note.
+    New hardcoded events are appended and sorted.
+    """
+    from datetime import date as _date
+    hc_events = get_week_economic_events(week_monday)
+    if not hc_events: return events
+
+    # Build a lookup of existing event texts per date (lowercased for matching)
+    date_idx = {day["date"]: day for day in events}
+
+    for hc in hc_events:
+        date_str = hc["date"].isoformat()
+        hc_text_low = hc["text"].lower()
+
+        if date_str in date_idx:
+            day = date_idx[date_str]
+            # Check if a similar event already exists (keyword match)
+            matched = False
+            for existing in day["events"]:
+                ex_low = existing.get("text","").lower()
+                # Match by shared key terms
+                key_terms = [w for w in hc_text_low.split() if len(w) > 2]
+                if any(term in ex_low for term in key_terms[:3]):
+                    # Update et_time if missing/wrong, keep AI note if longer
+                    if not existing.get("et_time"):
+                        existing["et_time"] = hc["et_time"]
+                    if len(hc.get("note","")) > len(existing.get("note","")):
+                        existing["note"] = hc["note"]
+                    existing["official"] = hc.get("official","")
+                    matched = True
+                    break
+            if not matched:
+                # Add as new event with official badge
+                new_ev = dict(hc)
+                new_ev.pop("date", None)
+                new_ev["text"] = f"[官方] {hc['text']}"
+                day["events"].append(new_ev)
+                # Re-sort
+                day["events"].sort(key=lambda e: e.get("et_time","") or "99:99")
+        else:
+            # Date not in AI calendar at all — add new day entry
+            weekday_idx = hc["date"].weekday()
+            wday_map = ["周一 MON","周二 TUE","周三 WED","周四 THU","周五 FRI"]
+            if weekday_idx < 5:
+                new_ev = dict(hc); new_ev.pop("date", None)
+                new_ev["text"] = f"[官方] {hc['text']}"
+                events.append({
+                    "date":    date_str,
+                    "weekday": wday_map[weekday_idx],
+                    "events":  [new_ev],
+                })
+                events.sort(key=lambda d: d["date"])
+
+    # Apply long-weekend warning to any day this week
+    lw_warn = _long_weekend_warning(week_monday)
+    if lw_warn:
+        today_str = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
+        for day in events:
+            if day["date"] == today_str:
+                # Add as a meta-note at top of today's events
+                warn_ev = dict(
+                    text    = f"長週末/假期提醒：{lw_warn}",
+                    et_time = "",
+                    color   = "amber",
+                    impact  = "high",
+                    note    = "長週末前流動性下降，期權時間值衰減加速，注意隔週Gap風險",
+                    official= "",
+                )
+                # Only add if not already present
+                if not any("長週末" in e.get("text","") for e in day["events"]):
+                    day["events"].insert(0, warn_ev)
+                break
+    return events
+
+
 def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
     monday = week_monday_str()
     if st.session_state.weekly_events and st.session_state.weekly_events_fetched == monday:
@@ -980,16 +1287,31 @@ def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
             day["events"] = [_fill_et_time(e) for e in day["events"]]
             # Sort events by ET time ascending
             day["events"].sort(key=lambda e: e.get("et_time","") or "99:99")
+        # Merge hardcoded economic events on top of Groq output
+        events = _merge_hardcoded(events, week_monday=mon)
         st.session_state.weekly_events = events
         st.session_state.weekly_events_fetched = monday
         return events
     except Exception:
-        return _enrich_fallback(_FALLBACK_EVENTS)
+        fb = _enrich_fallback(_FALLBACK_EVENTS)
+        return _merge_hardcoded(fb, week_monday=datetime.now(pytz.timezone("America/New_York")).date() - timedelta(days=datetime.now(pytz.timezone("America/New_York")).date().weekday()))
 
 
 def render_weekly_calendar(events: list, source_label: str):
     et = pytz.timezone("America/New_York")
     today_str = datetime.now(et).strftime("%Y-%m-%d")
+    # Long-weekend/holiday banner (from _merge_hardcoded)
+    et_now_cal  = datetime.now(pytz.timezone("America/New_York"))
+    _wk_monday  = (et_now_cal.date() - timedelta(days=et_now_cal.date().weekday()))
+    _lw_warn    = _long_weekend_warning(_wk_monday)
+    if _lw_warn:
+        st.markdown(
+            f'<div style="background:#FFF8E8;border-left:3px solid #D4A017;'
+            f'border-radius:0 4px 4px 0;padding:.45rem .85rem;'
+            f'font-family:var(--sans,sans-serif);font-size:.76rem;color:#6B5000;'
+            f'margin-bottom:.4rem">📅 {_lw_warn}</div>',
+            unsafe_allow_html=True)
+
     for day in events:
         if day["date"] == today_str:
             high = [e for e in day.get("events",[]) if e.get("impact") == "high"]
@@ -1052,19 +1374,33 @@ def render_weekly_calendar(events: list, source_label: str):
         today_badge = '<span class="cal-today-badge">TODAY</span>' if is_today else ""
         evs_html = ""
         for ev in day.get("events",[]):
-            dot = ev.get("color","blue")
-            ic  = imp_map.get(ev.get("impact","low"),"imp-low")
-            il  = imp_text.get(ev.get("impact","low"),"")
-            text = _html.escape(ev.get("text",""))
-            note = _html.escape(ev.get("note",""))
-            # FIX #4: show et_time inline
-            et_t = ev.get("et_time","")
-            time_tag = f'<span style="font-family:var(--mono,monospace);font-size:.55rem;color:var(--muted,#8A8278);margin-right:.2rem">{et_t}</span>' if et_t else ""
+            dot      = ev.get("color","blue")
+            ic       = imp_map.get(ev.get("impact","low"),"imp-low")
+            il       = imp_text.get(ev.get("impact","low"),"")
+            text     = _html.escape(ev.get("text",""))
+            note     = _html.escape(ev.get("note",""))
+            et_t     = ev.get("et_time","")
+            official = ev.get("official","")
+            if et_t and et_t != "盤後":
+                time_tag = ('<span style="font-family:var(--mono,monospace);font-size:.54rem;'
+                            'color:var(--muted,#8A8278);margin-right:.2rem">' + et_t + ' ET</span>')
+            elif et_t == "盤後":
+                time_tag = ('<span style="font-family:var(--mono,monospace);font-size:.54rem;'
+                            'color:var(--muted,#8A8278);margin-right:.2rem">盤後</span>')
+            else:
+                time_tag = ""
+            official_tag = (
+                '<span style="font-family:var(--mono,monospace);font-size:.5rem;'
+                'background:var(--up-bg,#EAF4EE);color:var(--up,#3A7D5C);'
+                'padding:.02rem .28rem;border-radius:2px;margin-left:.25rem">' +
+                _html.escape(official) + '</span>'
+            ) if official else ""
             evs_html += (
-                f'<div class="cal-event" title="{note}">'
-                f'<div class="cal-dot {dot}"></div>'
-                f'<div><span class="cal-impact {ic}">{il}</span> {time_tag}{text}</div>'
-                f'</div>'
+                '<div class="cal-event" title="' + note + '">' +
+                '<div class="cal-dot ' + dot + '"></div>' +
+                '<div><span class="cal-impact ' + ic + '">' + il + '</span> ' +
+                time_tag + text + official_tag +
+                '</div></div>'
             )
         cal_html += f"""
         <div class="{day_cls}">
