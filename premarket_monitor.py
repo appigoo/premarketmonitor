@@ -1424,13 +1424,15 @@ def render_weekly_calendar(events: list, source_label: str):
                 time_tag + text + official_tag +
                 '</div></div>'
             )
-        cal_html += f"""
-        <div class="{day_cls}">
-          <div class="cal-dayname">{day['weekday']}</div>
-          <div class="cal-date">{date_disp}{today_badge}</div>
-          {evs_html}
-        </div>"""
-    cal_html += f'</div><div class="cal-source">{source_label}</div></div>'
+        # String concat only — no f-string with embedded HTML
+        cal_html += (
+            '<div class="' + day_cls + '">' +
+            '<div class="cal-dayname">' + day['weekday'] + '</div>' +
+            '<div class="cal-date">' + date_disp + today_badge + '</div>' +
+            evs_html +
+            '</div>'
+        )
+    cal_html += '</div><div class="cal-source">' + _html.escape(source_label) + '</div></div>'
     st.markdown(cal_html, unsafe_allow_html=True)
     with st.expander("📋 詳細事件影響分析", expanded=False):
         for day in events:
