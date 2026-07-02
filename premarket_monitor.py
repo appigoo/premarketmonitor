@@ -991,32 +991,23 @@ def get_economic_calendar(year: int, month: int) -> list[dict]:
 def get_week_economic_events(week_monday) -> list[dict]:
     """
     Get all hardcoded economic events for the week of week_monday.
-    Includes today and up to 2 business days back (catches early releases
-    like NFP moved to Thursday, TSLA delivery on Wednesday, etc.)
+    Returns events where date falls in Mon-Fri of that week.
     """
-    from datetime import date as _date, timedelta as _td
-    week_end = week_monday + _td(days=4)   # Friday
+    from datetime import timedelta as _td
+    week_end = week_monday + _td(days=4)
 
-    # Look back up to 2 extra days before Monday to catch events
-    # in prior week that spill into this week's trading context
-    look_back = week_monday - _td(days=2)
-
-    # Check all relevant months
+    # Check current month + adjacent months for events that fall in this week
     months_to_check = set()
-    for offset in range(-2, 6):
-        d = week_monday + _td(days=offset)
-        months_to_check.add((d.year, d.month))
-    # Also check adjacent months (e.g. event on June 30 shown in July week)
-    months_to_check.add(((week_monday - _td(days=1)).year,
-                          (week_monday - _td(days=1)).month))
+    months_to_check.add((week_monday.year, week_monday.month))
+    months_to_check.add((week_end.year,    week_end.month))
 
     all_events = []
     for yr, mo in months_to_check:
         all_events.extend(get_economic_calendar(yr, mo))
 
-    # Include events from look_back to week_end
+    # Filter to this week
     week_events = [e for e in all_events
-                   if look_back <= e["date"] <= week_end]
+                   if week_monday <= e["date"] <= week_end]
     return week_events
 
 
@@ -1112,24 +1103,28 @@ def _enrich_fallback(events: list) -> list:
     return enriched
 
 
-def _build_fallback_events() -> list:
-    """
-    Dynamically build fallback events for the current week.
-    Hardcoded economic events will be merged on top via _merge_hardcoded().
-    This prevents stale fallback data from overriding current-week events.
-    """
-    et = pytz.timezone("America/New_York")
-    today = datetime.now(et).date()
-    mon   = today - timedelta(days=today.weekday())
-    wdays = ["周一 MON","周二 TUE","周三 WED","周四 THU","周五 FRI"]
-    days  = []
-    for i in range(5):
-        d = mon + timedelta(days=i)
-        days.append({"date": d.isoformat(), "weekday": wdays[i], "events": []})
-    # Add generic placeholders — _merge_hardcoded will fill in real events
-    return days
-
-_FALLBACK_EVENTS = _build_fallback_events()
+_FALLBACK_EVENTS = [
+    {"date":"2026-06-09","weekday":"周一 MON","events":[
+        {"text":"Kevin Warsh 就任美聯儲主席","color":"red","impact":"high","note":"Warsh 鷹派傾向，加息預期上移","et_time":""},
+        {"text":"美中貿易談判磋商","color":"amber","impact":"high","note":"90天關稅暫緩窗口期","et_time":""},
+    ]},
+    {"date":"2026-06-10","weekday":"周二 TUE","events":[
+        {"text":"5月 CPI 數據","color":"red","impact":"high","note":"YoY 3.8%；偏熱→沽科技","et_time":"08:30"},
+    ]},
+    {"date":"2026-06-11","weekday":"周三 WED","events":[
+        {"text":"5月 PPI 數據","color":"amber","impact":"high","note":"配合CPI判斷通脹方向","et_time":"08:30"},
+        {"text":"伊朗/霍爾木茲局勢","color":"red","impact":"high","note":"和平協議談判中，影響油價","et_time":""},
+    ]},
+    {"date":"2026-06-12","weekday":"周四 THU","events":[
+        {"text":"SpaceX (SPCX) Nasdaq IPO","color":"green","impact":"high","note":"$135/股，$1.77T估值","et_time":"09:30"},
+        {"text":"密歇根大學消費者信心","color":"amber","impact":"med","note":"通脹預期數據影響Fed路徑","et_time":"10:00"},
+        {"text":"Baker Hughes 鑽井數","color":"blue","impact":"low","note":"油市供應端參考","et_time":"13:00"},
+    ]},
+    {"date":"2026-06-13","weekday":"周五 FRI","events":[
+        {"text":"FOMC 靜默期（下週一三）","color":"purple","impact":"high","note":"Warsh 首次FOMC 6/16-17","et_time":""},
+        {"text":"美伊和平協議後續","color":"red","impact":"high","note":"若簽署→週一油價急跌","et_time":""},
+    ]},
+]
 
 _WEEKDAY_MAP = ["周一 MON","周二 TUE","周三 WED","周四 THU","周五 FRI","周六 SAT","周日 SUN"]
 
@@ -1212,28 +1207,11 @@ def _merge_hardcoded(events: list, week_monday) -> list:
 
 
 def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
-    monday   = week_monday_str()
-    et_now   = datetime.now(pytz.timezone("America/New_York"))
-    today_key = et_now.strftime("%Y-%m-%d")
-
-    # Cache hit: re-apply _merge_hardcoded every time (handles holiday adjustments)
-    # Cache key uses today not monday — ensures hardcoded events update daily
-    if st.session_state.weekly_events and st.session_state.weekly_events_fetched == today_key:
+    monday = week_monday_str()
+    if st.session_state.weekly_events and st.session_state.weekly_events_fetched == monday:
         return st.session_state.weekly_events
-
-    # Even on a stale weekly cache, re-merge hardcoded events and return
-    if st.session_state.weekly_events and st.session_state.weekly_events_fetched.startswith(monday[:7]):
-        _today = et_now.date()
-        _mon   = _today - timedelta(days=_today.weekday())
-        refreshed = _merge_hardcoded(st.session_state.weekly_events, week_monday=_mon)
-        st.session_state.weekly_events = refreshed
-        st.session_state.weekly_events_fetched = today_key
-        return refreshed
-
     if not serper_key or not groq_key:
-        _today = et_now.date()
-        _mon   = _today - timedelta(days=_today.weekday())
-        return _merge_hardcoded(_enrich_fallback(_FALLBACK_EVENTS), week_monday=_mon)
+        return _enrich_fallback(_FALLBACK_EVENTS)
     queries = [
         "US economic calendar CPI PPI retail sales this week",
         "Federal Reserve Fed chair Warsh Powell FOMC this week",
@@ -1312,7 +1290,7 @@ def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
         # Merge hardcoded economic events on top of Groq output
         events = _merge_hardcoded(events, week_monday=mon)
         st.session_state.weekly_events = events
-        st.session_state.weekly_events_fetched = today_key   # daily cache key
+        st.session_state.weekly_events_fetched = monday
         return events
     except Exception:
         fb = _enrich_fallback(_FALLBACK_EVENTS)
@@ -1424,15 +1402,13 @@ def render_weekly_calendar(events: list, source_label: str):
                 time_tag + text + official_tag +
                 '</div></div>'
             )
-        # String concat only — no f-string with embedded HTML
-        cal_html += (
-            '<div class="' + day_cls + '">' +
-            '<div class="cal-dayname">' + day['weekday'] + '</div>' +
-            '<div class="cal-date">' + date_disp + today_badge + '</div>' +
-            evs_html +
-            '</div>'
-        )
-    cal_html += '</div><div class="cal-source">' + _html.escape(source_label) + '</div></div>'
+        cal_html += f"""
+        <div class="{day_cls}">
+          <div class="cal-dayname">{day['weekday']}</div>
+          <div class="cal-date">{date_disp}{today_badge}</div>
+          {evs_html}
+        </div>"""
+    cal_html += f'</div><div class="cal-source">{source_label}</div></div>'
     st.markdown(cal_html, unsafe_allow_html=True)
     with st.expander("📋 詳細事件影響分析", expanded=False):
         for day in events:
@@ -3402,7 +3378,6 @@ def main():
         if st.button("🔄 立即刷新全部"):
             st.cache_data.clear()
             st.session_state.weekly_events = None
-            st.session_state.weekly_events_fetched = ""   # force re-merge
             st.rerun()
         if st.button("🗓️ 重新生成週曆"):
             st.session_state.weekly_events = None
