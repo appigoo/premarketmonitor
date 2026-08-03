@@ -457,7 +457,13 @@ def _yahoo_chart_api(ticker: str) -> dict:
     result = data["chart"]["result"][0]
     meta   = result["meta"]
     price  = meta.get("regularMarketPrice") or meta.get("previousClose")
-    prev   = meta.get("chartPreviousClose") or meta.get("previousClose") or price
+    # FIX #2: prefer chartPreviousClose (true prior close) over previousClose
+    # chartPreviousClose is the official prior regular-session close,
+    # not affected by pre/post market prints or intraday 1m bar artefacts
+    prev   = (meta.get("chartPreviousClose")
+              or meta.get("regularMarketPreviousClose")
+              or meta.get("previousClose")
+              or price)
     pre_price  = meta.get("preMarketPrice")
     post_price = meta.get("postMarketPrice")
 
@@ -529,7 +535,20 @@ def _yf_download_fallback(ticker: str) -> dict:
     prev_df  = df[df.index.date < today]
     def _last(d, col="Close"):
         return float(d[col].iloc[-1]) if not d.empty and col in d.columns else None
-    prev_close = _last(prev_df); reg_price = _last(reg_df) or _last(today_df)
+    # Use last business day close as baseline (exclude today)
+    prev_close = _last(prev_df)
+    # If prev_df empty (e.g. Monday pre-market), try fetching 5d daily bars
+    if not prev_close:
+        try:
+            _df5 = yf.download(ticker, period="5d", interval="1d",
+                               progress=False, auto_adjust=True)
+            if not _df5.empty:
+                if isinstance(_df5.columns, pd.MultiIndex): _df5.columns = _df5.columns.get_level_values(0)
+                _closes = [float(v) for v in _df5["Close"].dropna().tolist()]
+                if len(_closes) >= 2: prev_close = _closes[-2]
+                elif len(_closes) == 1: prev_close = _closes[-1]
+        except Exception: pass
+    reg_price = _last(reg_df) or _last(today_df)
     pre_price = _last(pre_df);   post_price = _last(post_df)
     def _cp(p, base):
         if p and base: return p - base, (p - base) / base * 100
@@ -966,6 +985,111 @@ def get_economic_calendar(year: int, month: int) -> list[dict]:
             official= "Tesla IR",
         ))
 
+    # ── ISM Manufacturing PMI ── first business day of each month, 10:00 ET
+    # Released same day as S&P Global Manufacturing PMI final (09:45 ET)
+    # and Construction Spending (10:00 ET)
+    first_bd_ism = _date(year, month, 1)
+    while first_bd_ism.weekday() >= 5 or _is_us_holiday(first_bd_ism):
+        first_bd_ism += _td(days=1)
+    adj_ism, _, reason_ism = _adjust_for_holiday(first_bd_ism)
+    prev_month_name_ism = ["1月","2月","3月","4月","5月","6月","7月","8月","9月","10月","11月","12月"][(month-2)%12]
+    adj_note_ism = f"（{reason_ism}）" if reason_ism else ""
+    # ISM Manufacturing (10:00 ET)
+    events.append(dict(
+        date    = adj_ism,
+        text    = f"{prev_month_name_ism} ISM 製造業 PMI{adj_note_ism}",
+        et_time = "10:00",
+        color   = "red",
+        impact  = "high",
+        note    = "製造業景氣最關鍵先行指標。>50=擴張/<50=收縮。新訂單+就業子指數影響Fed判斷。高於預期→美元升/債息升；低於預期→降息預期升→科技/TSLA利好。",
+        official= "ISM",
+    ))
+    # S&P Global Manufacturing PMI Final (09:45 ET) — same day as ISM
+    events.append(dict(
+        date    = adj_ism,
+        text    = f"S&P Global 製造業 PMI 終值{adj_note_ism}",
+        et_time = "09:45",
+        color   = "amber",
+        impact  = "med",
+        note    = "製造業PMI終值，通常與初值接近；若與ISM出現明顯分歧則值得關注。",
+        official= "S&P Global",
+    ))
+    # Construction Spending (10:00 ET) — same day as ISM
+    events.append(dict(
+        date    = adj_ism,
+        text    = f"{prev_month_name_ism}營建支出{adj_note_ism}",
+        et_time = "10:00",
+        color   = "blue",
+        impact  = "low",
+        note    = "月度營建支出數據，影響工業/地產板塊；對科技/TSLA直接影響有限。",
+        official= "Census Bureau",
+    ))
+
+    # ── ISM Services PMI ── approx 3rd business day of month, 10:00 ET
+    svc_bd = _date(year, month, 1)
+    bd_count = 0
+    for day_n in range(1, 10):
+        d = _date(year, month, day_n)
+        if d.weekday() < 5 and not _is_us_holiday(d):
+            bd_count += 1
+            if bd_count == 3:
+                svc_bd = d
+                break
+    adj_svc, _, _ = _adjust_for_holiday(svc_bd)
+    events.append(dict(
+        date    = adj_svc,
+        text    = f"{prev_month_name_ism} ISM 服務業 PMI",
+        et_time = "10:00",
+        color   = "amber",
+        impact  = "med",
+        note    = "服務業景氣指標（佔GDP近80%）。高於預期→通脹擔憂升；低於50→衰退預警。",
+        official= "ISM",
+    ))
+
+    # ── JOLTS Job Openings ── approx 2nd Tuesday of month, 10:00 ET
+    jolts_date = _nth_weekday(year, month, 2, 1)  # 2nd Tuesday
+    if jolts_date:
+        adj_jolts, _, _ = _adjust_for_holiday(jolts_date)
+        events.append(dict(
+            date    = adj_jolts,
+            text    = f"{prev_month_name_ism} JOLTS 職位空缺",
+            et_time = "10:00",
+            color   = "blue",
+            impact  = "med",
+            note    = "勞動力市場供需指標。Fed重視；空缺數高→勞市緊張→加息預期升。",
+            official= "BLS",
+        ))
+
+    # ── Retail Sales ── approx 2nd or 3rd week, often Wednesday
+    retail_approx = _nth_weekday(year, month, 2, 2)  # 2nd Wednesday
+    if retail_approx:
+        adj_retail, _, _ = _adjust_for_holiday(retail_approx)
+        events.append(dict(
+            date    = adj_retail,
+            text    = f"{prev_month_name_ism}零售銷售數據",
+            et_time = "08:30",
+            color   = "amber",
+            impact  = "med",
+            note    = "消費支出最即時指標。超預期→消費強勁/通脹擔憂；低於預期→降息預期升。",
+            official= "Census Bureau",
+        ))
+
+    # ── Initial Jobless Claims ── every Thursday, 08:30 ET
+    # Add for all 4 Thursdays of month
+    for week_n in range(1, 5):
+        thu = _nth_weekday(year, month, week_n, 3)
+        if thu:
+            adj_thu, _, _ = _adjust_for_holiday(thu)
+            events.append(dict(
+                date    = adj_thu,
+                text    = "初領失業救濟金（週度）",
+                et_time = "08:30",
+                color   = "blue",
+                impact  = "low",
+                note    = "每週就業先行指標。突破25萬→勞市惡化信號；Fed密切追蹤。",
+                official= "DOL",
+            ))
+
     # ── Michigan Consumer Sentiment ── last Friday of month (preliminary)
     last_fri = None
     for day in range(_calendar.monthrange(year, month)[1], 0, -1):
@@ -991,23 +1115,32 @@ def get_economic_calendar(year: int, month: int) -> list[dict]:
 def get_week_economic_events(week_monday) -> list[dict]:
     """
     Get all hardcoded economic events for the week of week_monday.
-    Returns events where date falls in Mon-Fri of that week.
+    Includes today and up to 2 business days back (catches early releases
+    like NFP moved to Thursday, TSLA delivery on Wednesday, etc.)
     """
-    from datetime import timedelta as _td
-    week_end = week_monday + _td(days=4)
+    from datetime import date as _date, timedelta as _td
+    week_end = week_monday + _td(days=4)   # Friday
 
-    # Check current month + adjacent months for events that fall in this week
+    # Look back up to 2 extra days before Monday to catch events
+    # in prior week that spill into this week's trading context
+    look_back = week_monday - _td(days=2)
+
+    # Check all relevant months
     months_to_check = set()
-    months_to_check.add((week_monday.year, week_monday.month))
-    months_to_check.add((week_end.year,    week_end.month))
+    for offset in range(-2, 6):
+        d = week_monday + _td(days=offset)
+        months_to_check.add((d.year, d.month))
+    # Also check adjacent months (e.g. event on June 30 shown in July week)
+    months_to_check.add(((week_monday - _td(days=1)).year,
+                          (week_monday - _td(days=1)).month))
 
     all_events = []
     for yr, mo in months_to_check:
         all_events.extend(get_economic_calendar(yr, mo))
 
-    # Filter to this week
+    # Include events from look_back to week_end
     week_events = [e for e in all_events
-                   if week_monday <= e["date"] <= week_end]
+                   if look_back <= e["date"] <= week_end]
     return week_events
 
 
@@ -1103,28 +1236,24 @@ def _enrich_fallback(events: list) -> list:
     return enriched
 
 
-_FALLBACK_EVENTS = [
-    {"date":"2026-06-09","weekday":"周一 MON","events":[
-        {"text":"Kevin Warsh 就任美聯儲主席","color":"red","impact":"high","note":"Warsh 鷹派傾向，加息預期上移","et_time":""},
-        {"text":"美中貿易談判磋商","color":"amber","impact":"high","note":"90天關稅暫緩窗口期","et_time":""},
-    ]},
-    {"date":"2026-06-10","weekday":"周二 TUE","events":[
-        {"text":"5月 CPI 數據","color":"red","impact":"high","note":"YoY 3.8%；偏熱→沽科技","et_time":"08:30"},
-    ]},
-    {"date":"2026-06-11","weekday":"周三 WED","events":[
-        {"text":"5月 PPI 數據","color":"amber","impact":"high","note":"配合CPI判斷通脹方向","et_time":"08:30"},
-        {"text":"伊朗/霍爾木茲局勢","color":"red","impact":"high","note":"和平協議談判中，影響油價","et_time":""},
-    ]},
-    {"date":"2026-06-12","weekday":"周四 THU","events":[
-        {"text":"SpaceX (SPCX) Nasdaq IPO","color":"green","impact":"high","note":"$135/股，$1.77T估值","et_time":"09:30"},
-        {"text":"密歇根大學消費者信心","color":"amber","impact":"med","note":"通脹預期數據影響Fed路徑","et_time":"10:00"},
-        {"text":"Baker Hughes 鑽井數","color":"blue","impact":"low","note":"油市供應端參考","et_time":"13:00"},
-    ]},
-    {"date":"2026-06-13","weekday":"周五 FRI","events":[
-        {"text":"FOMC 靜默期（下週一三）","color":"purple","impact":"high","note":"Warsh 首次FOMC 6/16-17","et_time":""},
-        {"text":"美伊和平協議後續","color":"red","impact":"high","note":"若簽署→週一油價急跌","et_time":""},
-    ]},
-]
+def _build_fallback_events() -> list:
+    """
+    Dynamically build fallback events for the current week.
+    Hardcoded economic events will be merged on top via _merge_hardcoded().
+    This prevents stale fallback data from overriding current-week events.
+    """
+    et = pytz.timezone("America/New_York")
+    today = datetime.now(et).date()
+    mon   = today - timedelta(days=today.weekday())
+    wdays = ["周一 MON","周二 TUE","周三 WED","周四 THU","周五 FRI"]
+    days  = []
+    for i in range(5):
+        d = mon + timedelta(days=i)
+        days.append({"date": d.isoformat(), "weekday": wdays[i], "events": []})
+    # Add generic placeholders — _merge_hardcoded will fill in real events
+    return days
+
+_FALLBACK_EVENTS = _build_fallback_events()
 
 _WEEKDAY_MAP = ["周一 MON","周二 TUE","周三 WED","周四 THU","周五 FRI","周六 SAT","周日 SUN"]
 
@@ -1207,11 +1336,28 @@ def _merge_hardcoded(events: list, week_monday) -> list:
 
 
 def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
-    monday = week_monday_str()
-    if st.session_state.weekly_events and st.session_state.weekly_events_fetched == monday:
+    monday   = week_monday_str()
+    et_now   = datetime.now(pytz.timezone("America/New_York"))
+    today_key = et_now.strftime("%Y-%m-%d")
+
+    # Cache hit: re-apply _merge_hardcoded every time (handles holiday adjustments)
+    # Cache key uses today not monday — ensures hardcoded events update daily
+    if st.session_state.weekly_events and st.session_state.weekly_events_fetched == today_key:
         return st.session_state.weekly_events
+
+    # Even on a stale weekly cache, re-merge hardcoded events and return
+    if st.session_state.weekly_events and st.session_state.weekly_events_fetched.startswith(monday[:7]):
+        _today = et_now.date()
+        _mon   = _today - timedelta(days=_today.weekday())
+        refreshed = _merge_hardcoded(st.session_state.weekly_events, week_monday=_mon)
+        st.session_state.weekly_events = refreshed
+        st.session_state.weekly_events_fetched = today_key
+        return refreshed
+
     if not serper_key or not groq_key:
-        return _enrich_fallback(_FALLBACK_EVENTS)
+        _today = et_now.date()
+        _mon   = _today - timedelta(days=_today.weekday())
+        return _merge_hardcoded(_enrich_fallback(_FALLBACK_EVENTS), week_monday=_mon)
     queries = [
         "US economic calendar CPI PPI retail sales this week",
         "Federal Reserve Fed chair Warsh Powell FOMC this week",
@@ -1290,7 +1436,7 @@ def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
         # Merge hardcoded economic events on top of Groq output
         events = _merge_hardcoded(events, week_monday=mon)
         st.session_state.weekly_events = events
-        st.session_state.weekly_events_fetched = monday
+        st.session_state.weekly_events_fetched = today_key   # daily cache key
         return events
     except Exception:
         fb = _enrich_fallback(_FALLBACK_EVENTS)
@@ -1402,13 +1548,15 @@ def render_weekly_calendar(events: list, source_label: str):
                 time_tag + text + official_tag +
                 '</div></div>'
             )
-        cal_html += f"""
-        <div class="{day_cls}">
-          <div class="cal-dayname">{day['weekday']}</div>
-          <div class="cal-date">{date_disp}{today_badge}</div>
-          {evs_html}
-        </div>"""
-    cal_html += f'</div><div class="cal-source">{source_label}</div></div>'
+        # String concat only — no f-string with embedded HTML
+        cal_html += (
+            '<div class="' + day_cls + '">' +
+            '<div class="cal-dayname">' + day['weekday'] + '</div>' +
+            '<div class="cal-date">' + date_disp + today_badge + '</div>' +
+            evs_html +
+            '</div>'
+        )
+    cal_html += '</div><div class="cal-source">' + _html.escape(source_label) + '</div></div>'
     st.markdown(cal_html, unsafe_allow_html=True)
     with st.expander("📋 詳細事件影響分析", expanded=False):
         for day in events:
@@ -1649,6 +1797,18 @@ def _rotation_insight(sectors: list) -> str:
 
 def render_sector_panel():
     st.markdown('<div class="section-label">▸ 🔄 板塊輪動監控</div>', unsafe_allow_html=True)
+    # FIX #3: Pre-market low-liquidity warning for sector data
+    et_t    = datetime.now(pytz.timezone("America/New_York")).time()
+    _is_pre = time(4, 0) <= et_t < time(9, 30)
+    if _is_pre:
+        st.markdown(
+            '<div style="background:#FFF8E8;border-left:3px solid #D4A017;'
+            'border-radius:0 4px 4px 0;padding:.38rem .8rem;font-size:.72rem;'
+            'color:#6B5000;margin-bottom:.4rem">'
+            '⚠️ <b>盤前警告</b>：板塊ETF盤前成交量極低，單筆大單可造成±3-5%虛假波幅。'
+            '以下數字僅供參考，<b>請勿以盤前板塊輪動做入場決策</b>，建議等10:00 ET後再看。'
+            '</div>',
+            unsafe_allow_html=True)
     with st.spinner("載入板塊數據..."):
         sectors = fetch_sectors()
 
@@ -2615,59 +2775,74 @@ def render_relative_strength():
 
 # ── #4 Put/Call Ratio ─────────────────────────────────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
+def _make_yf_ticker(symbol: str):
+    """Create yf.Ticker with curl_cffi session for cloud compatibility."""
+    try:
+        from curl_cffi import requests as _cr
+        _sess = _cr.Session(impersonate="chrome124")
+        return yf.Ticker(symbol, session=_sess)
+    except Exception:
+        return yf.Ticker(symbol)
+
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_put_call_ratio(tickers: list[str] | None = None) -> dict:
     """
     Fetch Put/Call ratio from Yahoo Finance options chain.
-    tickers: list of symbols to check. Default: TSLA + SPY.
+    Uses curl_cffi session for Streamlit Cloud compatibility.
+    Falls back to OI-only if volume data missing (pre-market).
     Returns dict keyed by ticker: {put_vol, call_vol, pc_ratio, error}
     """
     if tickers is None:
         tickers = ["TSLA", "SPY"]
     results = {}
     for ticker in tickers:
-        try:
-            t    = yf.Ticker(ticker)
-            exp  = t.options          # list of expiry dates
-            if not exp:
-                results[ticker] = dict(error="no options")
-                continue
-            # Use nearest expiry (index 0) for most liquid/timely signal
-            chain = t.option_chain(exp[0])
-            puts  = chain.puts
-            calls = chain.calls
-
-            put_vol  = int(puts["volume"].fillna(0).sum())
-            call_vol = int(calls["volume"].fillna(0).sum())
-            put_oi   = int(puts["openInterest"].fillna(0).sum())
-            call_oi  = int(calls["openInterest"].fillna(0).sum())
-
-            pc_vol = put_vol  / call_vol  if call_vol  > 0 else None
-            pc_oi  = put_oi   / call_oi   if call_oi   > 0 else None
-
-            # Also aggregate across all expiries for OI (more stable)
-            total_put_oi = 0; total_call_oi = 0
-            for e in exp[:4]:   # nearest 4 expiries
-                try:
-                    ch = t.option_chain(e)
-                    total_put_oi  += int(ch.puts["openInterest"].fillna(0).sum())
-                    total_call_oi += int(ch.calls["openInterest"].fillna(0).sum())
-                except Exception:
-                    break
-            pc_oi_all = total_put_oi / total_call_oi if total_call_oi > 0 else None
-
-            results[ticker] = dict(
-                put_vol   = put_vol,
-                call_vol  = call_vol,
-                put_oi    = put_oi,
-                call_oi   = call_oi,
-                pc_ratio  = pc_vol,      # volume-based (more timely)
-                pc_oi     = pc_oi,       # OI-based nearest expiry
-                pc_oi_all = pc_oi_all,   # OI-based all near expiries
-                expiry    = exp[0],
-                error     = None,
-            )
-        except Exception as e:
-            results[ticker] = dict(error=str(e)[:60])
+        d = None
+        # Attempt 1: curl_cffi session (best for cloud)
+        for _attempt in range(2):
+            try:
+                t   = _make_yf_ticker(ticker)
+                exp = t.options
+                if not exp:
+                    d = dict(error="no options data"); break
+                # Nearest expiry
+                chain    = t.option_chain(exp[0])
+                puts     = chain.puts
+                calls    = chain.calls
+                put_vol  = int(puts["volume"].fillna(0).sum())
+                call_vol = int(calls["volume"].fillna(0).sum())
+                put_oi   = int(puts["openInterest"].fillna(0).sum())
+                call_oi  = int(calls["openInterest"].fillna(0).sum())
+                # Volume P/C (may be 0 pre-market)
+                pc_vol = put_vol / call_vol if call_vol > 0 else None
+                pc_oi  = put_oi  / call_oi  if call_oi  > 0 else None
+                # Multi-expiry OI (more stable, works pre-market)
+                total_put_oi = put_oi; total_call_oi = call_oi
+                for e in exp[1:4]:
+                    try:
+                        ch = t.option_chain(e)
+                        total_put_oi  += int(ch.puts["openInterest"].fillna(0).sum())
+                        total_call_oi += int(ch.calls["openInterest"].fillna(0).sum())
+                    except Exception: break
+                pc_oi_all = total_put_oi / total_call_oi if total_call_oi > 0 else None
+                # Pre-market: volume often 0, fall back to OI ratio as primary signal
+                et_t = datetime.now(pytz.timezone("America/New_York")).time()
+                _is_pre = time(4, 0) <= et_t < time(9, 30)
+                primary_ratio = pc_vol if (pc_vol and not _is_pre) else pc_oi_all
+                d = dict(
+                    put_vol   = put_vol,  call_vol  = call_vol,
+                    put_oi    = put_oi,   call_oi   = call_oi,
+                    pc_ratio  = primary_ratio,
+                    pc_vol    = pc_vol,
+                    pc_oi     = pc_oi,    pc_oi_all = pc_oi_all,
+                    expiry    = exp[0],
+                    pre_market_mode = _is_pre,
+                    error     = None,
+                ); break
+            except Exception as e:
+                if _attempt == 1:
+                    d = dict(error=f"options chain: {str(e)[:40]}")
+                time_module.sleep(0.5)
+        results[ticker] = d or dict(error="fetch failed")
     return results
 
 
@@ -2733,8 +2908,10 @@ def render_put_call_panel():
             )
             continue
 
-        ratio   = d.get("pc_ratio")      # volume P/C
-        oi_rat  = d.get("pc_oi_all")     # OI P/C (all near expiries)
+        ratio        = d.get("pc_ratio")      # primary ratio (OI pre-market, vol regular)
+        pc_vol_raw   = d.get("pc_vol")       # raw volume ratio
+        oi_rat       = d.get("pc_oi_all")    # OI P/C (all near expiries)
+        pre_mkt_mode = d.get("pre_market_mode", False)
         expiry  = d.get("expiry","")
         put_vol = d.get("put_vol",0)
         call_vol= d.get("call_vol",0)
@@ -2748,18 +2925,19 @@ def render_put_call_panel():
 
         ratio_col = "down" if (ratio or 0) < 0.6 else ("up" if (ratio or 0) > 1.0 else "flat")
 
+        _mode_lbl = "OI比率(盤前)" if pre_mkt_mode else "Vol P/C"
+        _vol_sub  = f"Vol {pc_vol_raw:.2f}" if pc_vol_raw else "Vol 盤前量不足"
+        _ratio_str = f"{ratio:.2f}" if ratio else "—"
+        _oi_str    = f"{oi_rat:.2f}" if oi_rat else "—"
         html += (
-            f'<div class="pc-card {card_cls}">'
-            f'<div class="pc-label">{ticker} · Vol P/C</div>'
-            f'<div class="pc-val {ratio_col}">{f"{ratio:.2f}" if ratio else "—"}</div>'
-            f'<div class="pc-meter"><div class="pc-needle" style="left:{meter_pct:.0f}%"></div></div>'
-            f'<div class="pc-sub">'
-            f'Put {fmt_vol(put_vol)} / Call {fmt_vol(call_vol)}'
-            f'</div>'
-            f'<div class="pc-sub" style="margin-top:.1rem">'
-            f'OI比率 <b>{f"{oi_rat:.2f}" if oi_rat else "—"}</b> &nbsp;到期 {expiry}'
-            f'</div>'
-            f'</div>'
+            '<div class="pc-card ' + card_cls + '">' +
+            '<div class="pc-label">' + ticker + ' · ' + _mode_lbl + '</div>' +
+            '<div class="pc-val ' + ratio_col + '">' + _ratio_str + '</div>' +
+            '<div class="pc-meter"><div class="pc-needle" style="left:' + f"{meter_pct:.0f}" + '%"></div></div>' +
+            '<div class="pc-sub">Put ' + fmt_vol(put_vol) + ' / Call ' + fmt_vol(call_vol) + '</div>' +
+            '<div class="pc-sub" style="margin-top:.1rem">' +
+            _vol_sub + ' &nbsp;·&nbsp; OI <b>' + _oi_str + '</b> &nbsp;到期 ' + expiry +
+            '</div></div>'
         )
     html += '</div>'
 
@@ -3378,6 +3556,7 @@ def main():
         if st.button("🔄 立即刷新全部"):
             st.cache_data.clear()
             st.session_state.weekly_events = None
+            st.session_state.weekly_events_fetched = ""   # force re-merge
             st.rerun()
         if st.button("🗓️ 重新生成週曆"):
             st.session_state.weekly_events = None
