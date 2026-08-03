@@ -1226,8 +1226,10 @@ def _fill_et_time(event: dict) -> dict:
     return event
 
 
-def _enrich_fallback(events: list) -> list:
-    """Apply _fill_et_time and sort to fallback events list."""
+def _enrich_fallback(events: list | None) -> list:
+    """Apply _fill_et_time and sort to fallback events list. Handles None."""
+    if not events:
+        return _build_fallback_events()
     enriched = []
     for day in events:
         evs = [_fill_et_time(dict(e)) for e in day.get("events",[])]
@@ -1253,7 +1255,7 @@ def _build_fallback_events() -> list:
     # Add generic placeholders — _merge_hardcoded will fill in real events
     return days
 
-_FALLBACK_EVENTS = _build_fallback_events()
+_FALLBACK_EVENTS = None   # built lazily in fetch_weekly_events to avoid load-time issues
 
 _WEEKDAY_MAP = ["周一 MON","周二 TUE","周三 WED","周四 THU","周五 FRI","周六 SAT","周日 SUN"]
 
@@ -1342,7 +1344,7 @@ def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
 
     # Cache hit: re-apply _merge_hardcoded every time (handles holiday adjustments)
     # Cache key uses today not monday — ensures hardcoded events update daily
-    if st.session_state.weekly_events and st.session_state.weekly_events_fetched == today_key:
+    if st.session_state.get("weekly_events") and st.session_state.weekly_events_fetched == today_key:
         return st.session_state.weekly_events
 
     # Even on a stale weekly cache, re-merge hardcoded events and return
@@ -1357,7 +1359,10 @@ def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
     if not serper_key or not groq_key:
         _today = et_now.date()
         _mon   = _today - timedelta(days=_today.weekday())
-        return _merge_hardcoded(_enrich_fallback(_FALLBACK_EVENTS), week_monday=_mon)
+        fb = _merge_hardcoded(_build_fallback_events(), week_monday=_mon)
+        st.session_state.weekly_events = fb
+        st.session_state.weekly_events_fetched = today_key
+        return fb
     queries = [
         "US economic calendar CPI PPI retail sales this week",
         "Federal Reserve Fed chair Warsh Powell FOMC this week",
@@ -1375,11 +1380,14 @@ def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
                 snippets.append(f"[{item.get('date','')}] {item.get('title','')} — {item.get('snippet','')}")
         except Exception:
             pass
-    if not snippets:
-        return _enrich_fallback(_FALLBACK_EVENTS)
-    et = pytz.timezone("America/New_York")
+    et    = pytz.timezone("America/New_York")
     today = datetime.now(et).date()
     mon   = today - timedelta(days=today.weekday())
+    if not snippets:
+        fb = _merge_hardcoded(_build_fallback_events(), week_monday=mon)
+        st.session_state.weekly_events = fb
+        st.session_state.weekly_events_fetched = today_key
+        return fb
     dates = [(mon + timedelta(days=i)).isoformat() for i in range(5)]
     wdays = [_WEEKDAY_MAP[i] for i in range(5)]
     prompt = f"""你是美股宏觀分析師。根據以下本週新聞，為交易員生成一個五天事件日曆。
@@ -1439,8 +1447,12 @@ def fetch_weekly_events(serper_key: str, groq_key: str) -> list:
         st.session_state.weekly_events_fetched = today_key   # daily cache key
         return events
     except Exception:
-        fb = _enrich_fallback(_FALLBACK_EVENTS)
-        return _merge_hardcoded(fb, week_monday=datetime.now(pytz.timezone("America/New_York")).date() - timedelta(days=datetime.now(pytz.timezone("America/New_York")).date().weekday()))
+        _et2  = datetime.now(pytz.timezone("America/New_York"))
+        _mon2 = _et2.date() - timedelta(days=_et2.date().weekday())
+        fb    = _merge_hardcoded(_build_fallback_events(), week_monday=_mon2)
+        st.session_state.weekly_events = fb
+        st.session_state.weekly_events_fetched = _et2.strftime("%Y-%m-%d")
+        return fb
 
 
 def render_weekly_calendar(events: list, source_label: str):
